@@ -1,0 +1,364 @@
+name: build-bixi-kernel-ksu-susfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: "AOSP common kernel tag"
+        required: true
+        default: "android15-6.6-2025-03_r15"
+      manifest_branch:
+        description: "kernel/manifest branch"
+        required: true
+        default: "common-android15-6.6-2025-03"
+      kmi_tag:
+        description: "KMI generation tag for the version string"
+        required: true
+        default: "android15-8"
+      build_number:
+        description: "BUILD_NUMBER (stock bixi 6.6.77 = 13636293)"
+        required: true
+        default: "13636293"
+      version_suffix:
+        description: "Version string suffix, inserted before ab<build>"
+        required: true
+        default: "KSU-SUSFS"
+      kernelsu_ref:
+        description: "KernelSU commit to pin"
+        required: true
+        default: "932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e"
+      susfs_ref:
+        description: "susfs4ksu commit to pin (branch gki-android15-6.6)"
+        required: true
+        default: "eba2a88a5ba303e3d79d08e0717b956e9cf784a1"
+
+permissions:
+  contents: read
+
+env:
+  SRC: ${{ github.workspace }}/kernel-src
+  DIST: ${{ github.workspace }}/dist
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup /usr/lib/jvm \
+            /usr/local/share/boost
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            repo git curl wget python3 python-is-python3 bc bison flex \
+            build-essential libssl-dev libelf-dev libncurses-dev openssl \
+            lz4 zstd zip unzip rsync cpio dwarves device-tree-compiler \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          pahole --version
+          repo --version | head -1
+
+      - name: Sync AOSP GKI source
+        run: |
+          set -euo pipefail
+          git config --global user.name "bixi-ci"
+          git config --global user.email "bixi-ci@localhost"
+
+          mkdir -p "$SRC"
+          cd "$SRC"
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+            -b "${{ inputs.manifest_branch }}"
+
+          # Google deletes the dated release branch after a while, but the
+          # release tag survives. Point kernel/common at the tag explicitly.
+          TAG="${{ inputs.kernel_tag }}"
+          BRANCH="${{ inputs.manifest_branch }}"
+          BRANCH="${BRANCH#common-}"
+          sed -i "/name=\"kernel\/common\"/ s|revision=\"[^\"]*\"|revision=\"refs/tags/${TAG}\"|" \
+            .repo/manifests/default.xml
+          grep -n 'name="kernel/common"' .repo/manifests/default.xml
+
+          repo sync -c -j8 --fail-fast --no-clone-bundle --retry-fetches=3
+
+          git -C common checkout --detach "$TAG"
+          echo "kernel commit: $(git -C common rev-parse HEAD)"
+          head -6 common/Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+
+      - name: Select AOSP clang
+        run: |
+          set -euo pipefail
+          CLANG_VER=$(grep -m1 '^CLANG_VERSION=' "$SRC/common/build.config.constants" \
+            | cut -d= -f2 | tr -d '\r' || true)
+          echo "CLANG_VERSION=$CLANG_VER"
+          CLANG_DIR=$(find "$SRC/prebuilts/clang/host/linux-x86" \
+            -maxdepth 1 -type d -name "clang-${CLANG_VER}" | head -1)
+          if [ -z "$CLANG_DIR" ]; then
+            CLANG_DIR=$(find "$SRC/prebuilts/clang/host/linux-x86" \
+              -maxdepth 1 -type d -name 'clang-r510928' | head -1)
+          fi
+          if [ -z "$CLANG_DIR" ]; then
+            echo "clang not found; available:"
+            ls "$SRC/prebuilts/clang/host/linux-x86" || true
+            exit 1
+          fi
+          echo "$CLANG_DIR/bin" >> "$GITHUB_PATH"
+          "$CLANG_DIR/bin/clang" --version | head -2
+          "$CLANG_DIR/bin/clang" --version | grep -q 'r510928' \
+            || { echo "clang is not r510928; CFI may fail"; exit 1; }
+
+      - name: Install and pin KernelSU
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+
+          curl --fail --location --silent --show-error \
+            https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh \
+            -o /tmp/kernelsu-setup.sh
+          bash /tmp/kernelsu-setup.sh
+
+          if [[ "$(git -C common/KernelSU rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C common/KernelSU fetch --unshallow --tags origin
+          else
+            git -C common/KernelSU fetch --tags origin
+          fi
+
+          git -C common/KernelSU checkout --detach "${{ inputs.kernelsu_ref }}"
+          git -C common/KernelSU log -1 --format='%H%n%ci%n%s'
+          echo "--- KSU hook into drivers ---"
+          grep -n 'kernelsu' common/drivers/Makefile common/drivers/Kconfig
+
+      - name: Download and pin susfs4ksu
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+
+          git clone --branch gki-android15-6.6 --single-branch \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+          git -C susfs4ksu checkout --detach "${{ inputs.susfs_ref }}"
+          git -C susfs4ksu log -1 --format='%H%n%ci%n%s'
+
+      - name: Apply SUSFS patches
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+
+          cp susfs4ksu/kernel_patches/fs/susfs.c common/fs/
+          cp susfs4ksu/kernel_patches/include/linux/susfs.h \
+             susfs4ksu/kernel_patches/include/linux/susfs_def.h \
+             common/include/linux/
+
+          git -C common/KernelSU apply \
+            "$SRC/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+
+          # The 50_ patch was written against a newer 6.6 GKI tree; at the
+          # 6.6.77 tag the context may drift. git apply is atomic; fall back
+          # to patch(1) with fuzz before giving up.
+          git -C common apply \
+            "$SRC/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
+            || patch -d common -p1 --fuzz=8 \
+               < "$SRC/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
+
+          echo "--- susfs files in place ---"
+          ls -la common/fs/susfs.c common/include/linux/susfs.h \
+                 common/include/linux/susfs_def.h
+          grep -n 'susfs' common/fs/Makefile | head -5 || true
+
+      - name: Apply Clang 18 compatibility fix
+        run: |
+          set -euo pipefail
+
+          KSU_FILE="$SRC/common/KernelSU/kernel/feature/selinux_hide.c"
+
+          sed -i \
+            -e '/^[[:space:]]*if (security_dump_masked_av_fn)[[:space:]]*$/d' \
+            -e '/^[[:space:]]*if (context_struct_compute_av_fn) {[[:space:]]*$/,/^[[:space:]]*}[[:space:]]*$/c\
+              context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);' \
+            "$KSU_FILE"
+
+          grep -n -B3 -A5 \
+            -E 'security_dump_masked_av_fn|context_struct_compute_av_fn' \
+            "$KSU_FILE"
+
+      - name: Configure kernel
+        run: |
+          set -euo pipefail
+          cd "$SRC/common"
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/configs/bixi-stock.config" out/.config
+
+          # Force the stock-style release string with our suffix. MODVERSIONS
+          # ignores the release token when matching vendor module vermagic;
+          # symbol CRCs are gated separately below.
+          GHASH=$(git rev-parse --short=12 HEAD)
+          scripts/config --file out/.config --set-str LOCALVERSION \
+            "-${{ inputs.kmi_tag }}-g${GHASH}-${{ inputs.version_suffix }}-ab${{ inputs.build_number }}-4k"
+
+          scripts/config --file out/.config \
+            -e KSU -e KSU_SUSFS -e KSU_SUSFS_ENABLE_LOG \
+            -d LOCALVERSION_AUTO -d TRIM_UNUSED_KSYMS
+
+          # MODULE_SIG_PROTECT stays ON (stock bixi value). KSU/SUSFS are
+          # built-in and do not need module signing relaxed.
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out olddefconfig
+
+          for k in KSU; do
+            grep -q "^CONFIG_$k=y" out/.config || { echo "missing CONFIG_$k"; exit 1; }
+          done
+          for k in MODVERSIONS LTO_NONE CFI_CLANG SHADOW_CALL_STACK \
+                   DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES KPROBES; do
+            grep -q "^CONFIG_$k=y" out/.config || { echo "ABI-critical CONFIG_$k lost"; exit 1; }
+          done
+          grep -q "^CONFIG_LOCALVERSION=\"-${{ inputs.kmi_tag }}-g" out/.config
+          ! grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' out/.config
+
+          echo "--- KSU/SUSFS config as resolved by olddefconfig ---"
+          grep -E '^CONFIG_KSU' out/.config || true
+
+      - name: Build kernel and modules
+        run: |
+          set -euo pipefail
+          cd "$SRC/common"
+          sed -i 's/echo "+"//' scripts/setlocalversion 2>/dev/null || true
+          make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- O=out Image modules
+          echo "--- kernel banner ---"
+          strings out/arch/arm64/boot/Image | grep -m1 '^Linux version '
+
+      - name: Verify KernelSU and SUSFS are built in
+        run: |
+          set -euo pipefail
+          cd "$SRC/common"
+
+          echo "--- KernelSU marker ---"
+          strings out/arch/arm64/boot/Image | grep -m1 '/data/adb/ksu' \
+            || { echo "KernelSU strings not found in Image"; exit 1; }
+
+          echo "--- SUSFS marker ---"
+          strings out/arch/arm64/boot/Image | grep -m1 'susfs' \
+            || { echo "SUSFS strings not found in Image (CONFIG_KSU_SUSFS not resolved?)"; exit 1; }
+
+      - name: Gate vendor symbol CRCs
+        run: |
+          set -euo pipefail
+          cd "$SRC/common"
+          echo "--- module_layout ---"
+          grep -w module_layout out/Module.symvers
+          grep -q "$(printf '0x4e276f37\tmodule_layout\t')" out/Module.symvers \
+            || { echo "module_layout CRC is not the stock bixi value"; exit 1; }
+
+          echo "--- strict: rfkill (6.6.77, 58 imports) ---"
+          python3 "$GITHUB_WORKSPACE/scripts/check_vendor_crc.py" \
+            out/Module.symvers "$GITHUB_WORKSPACE/tests/vendor-rfkill.tsv"
+
+          echo "--- tolerant: other bixi vendor modules (module-to-module symbols allowed) ---"
+          for t in vendor-goodix vendor-synaptics vendor-xiaomi-touch vendor-nxp vendor-qca; do
+            python3 "$GITHUB_WORKSPACE/scripts/check_vendor_crc.py" \
+              out/Module.symvers "$GITHUB_WORKSPACE/tests/$t.tsv" --allow-missing
+          done
+
+      - name: Pack boot image
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          source "$GITHUB_WORKSPACE/configs/bixi-boot-avb.env"
+
+          MKBOOTIMG=$(find "$SRC" -maxdepth 5 -name mkbootimg.py | head -1)
+          AVBTOOL=$(find "$SRC/prebuilts" -maxdepth 8 -name avbtool | head -1)
+          UNPACK=$(find "$SRC" -maxdepth 5 -name unpack_bootimg.py | head -1)
+          [ -n "$MKBOOTIMG" ] && [ -n "$AVBTOOL" ] && [ -n "$UNPACK" ] || {
+            echo "mkbootimg/avbtool not found"; exit 1; }
+
+          mkdir -p "$DIST"
+          python3 "$MKBOOTIMG" \
+            --header_version 4 \
+            --kernel "$SRC/common/out/arch/arm64/boot/Image" \
+            --ramdisk /dev/null \
+            --cmdline '' \
+            --output "$DIST/boot-bixi-6.6.77-ksu-susfs.img"
+
+          "$AVBTOOL" add_hash_footer \
+            --image "$DIST/boot-bixi-6.6.77-ksu-susfs.img" \
+            --partition_name boot \
+            --partition_size "$PARTITION_SIZE" \
+            --algorithm NONE --hash_algorithm sha256 \
+            --rollback_index "$ROLLBACK_INDEX" \
+            --prop "com.android.build.boot.os_version:$OS_VERSION" \
+            --prop "com.android.build.boot.fingerprint:$FINGERPRINT" \
+            --prop "com.android.build.boot.security_patch:$SECURITY_PATCH"
+
+          stat -c 'boot image size: %s' "$DIST/boot-bixi-6.6.77-ksu-susfs.img"
+          test "$(stat -c '%s' "$DIST/boot-bixi-6.6.77-ksu-susfs.img")" -eq "$PARTITION_SIZE"
+          "$AVBTOOL" info_image --image "$DIST/boot-bixi-6.6.77-ksu-susfs.img" \
+            | tee "$DIST/GENERATED-BOOT-AVB-INFO.txt"
+
+          python3 "$UNPACK" --boot_img "$DIST/boot-bixi-6.6.77-ksu-susfs.img" --out "$DIST/verify"
+          cmp "$SRC/common/out/arch/arm64/boot/Image" "$DIST/verify/kernel"
+
+      - name: Collect kernel artifacts
+        run: |
+          set -euo pipefail
+          cp "$SRC/common/out/arch/arm64/boot/Image" "$DIST/Image"
+          cp "$SRC/common/out/Module.symvers" "$DIST/Module.symvers"
+          diff <(grep -E '^CONFIG_|^# CONFIG_' "$GITHUB_WORKSPACE/configs/bixi-stock.config" | sort) \
+               <(grep -E '^CONFIG_|^# CONFIG_' "$SRC/common/out/.config" | sort) \
+               > "$DIST/config.diff" || true
+
+          {
+            echo "kernel tag: ${{ inputs.kernel_tag }}"
+            echo "manifest branch: ${{ inputs.manifest_branch }}"
+            echo "kernel commit: $(git -C "$SRC/common" rev-parse HEAD)"
+            echo "build number: ${{ inputs.build_number }}"
+            echo "version suffix: ${{ inputs.version_suffix }}"
+            echo "KernelSU commit: $(git -C "$SRC/common/KernelSU" rev-parse HEAD)"
+            echo "SUSFS commit: $(git -C "$SRC/susfs4ksu" rev-parse HEAD)"
+            echo "clang: $(clang --version | head -1)"
+            echo "kernel banner: $(strings "$DIST/Image" | grep -m1 '^Linux version ')"
+            echo "module_layout: $(grep -w module_layout "$DIST/Module.symvers")"
+            echo "boot image sha256: $(sha256sum "$DIST/boot-bixi-6.6.77-ksu-susfs.img" | cut -d' ' -f1)"
+          } > "$DIST/BUILD-INFO.txt"
+
+          ( cd "$DIST" && sha256sum boot-bixi-6.6.77-ksu-susfs.img Image > SHA256SUMS.txt )
+
+          cat "$DIST/BUILD-INFO.txt"
+          cat "$DIST/SHA256SUMS.txt"
+          ls -lh "$DIST"
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bixi-kernel-ksu-susfs-${{ inputs.kernel_tag }}
+          path: |
+            dist/boot-bixi-6.6.77-ksu-susfs.img
+            dist/Image
+            dist/Module.symvers
+            dist/config.diff
+            dist/BUILD-INFO.txt
+            dist/GENERATED-BOOT-AVB-INFO.txt
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build SUSFS userspace module
+        run: |
+          set -euo pipefail
+          cd "$SRC/susfs4ksu"
+          bash ./build_ksu_module.sh
+          test -f ksu_module_susfs.zip
+          cp ksu_module_susfs.zip "$DIST/"
+
+      - name: Upload SUSFS module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ksu_module_susfs
+          path: dist/ksu_module_susfs.zip
+          if-no-files-found: error
+          retention-days: 30
