@@ -252,8 +252,10 @@ jobs:
           sed -i 's/echo "+"//' scripts/setlocalversion 2>/dev/null || true
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out Image modules
+          # pipefail + grep -m1 would SIGPIPE the strings producer; use a file
+          strings out/arch/arm64/boot/Image > out/Image.strings
           echo "--- kernel banner ---"
-          strings out/arch/arm64/boot/Image | grep -m1 '^Linux version '
+          grep -m1 '^Linux version ' out/Image.strings
 
       - name: Verify KernelSU and SUSFS are built in
         run: |
@@ -261,11 +263,11 @@ jobs:
           cd "$SRC/common"
 
           echo "--- KernelSU marker ---"
-          strings out/arch/arm64/boot/Image | grep -m1 '/data/adb/ksu' \
+          grep -m1 '/data/adb/ksu' out/Image.strings \
             || { echo "KernelSU strings not found in Image"; exit 1; }
 
           echo "--- SUSFS marker ---"
-          strings out/arch/arm64/boot/Image | grep -m1 'susfs' \
+          grep -m1 'susfs' out/Image.strings \
             || { echo "SUSFS strings not found in Image (CONFIG_KSU_SUSFS not resolved?)"; exit 1; }
 
       - name: Gate vendor symbol CRCs
@@ -343,7 +345,7 @@ jobs:
             echo "KernelSU commit: $(git -C "$SRC/common/KernelSU" rev-parse HEAD)"
             echo "SUSFS commit: $(git -C "$SRC/susfs4ksu" rev-parse HEAD)"
             echo "clang: $(clang --version | head -1)"
-            echo "kernel banner: $(strings "$DIST/Image" | grep -m1 '^Linux version ')"
+            echo "kernel banner: $(grep -m1 '^Linux version ' "$SRC/common/out/Image.strings")"
             echo "module_layout: $(grep -w module_layout "$DIST/Module.symvers")"
             echo "boot image sha256: $(sha256sum "$DIST/boot-bixi-6.6.77-ksu-susfs.img" | cut -d' ' -f1)"
           } > "$DIST/BUILD-INFO.txt"
