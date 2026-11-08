@@ -222,6 +222,12 @@ jobs:
             -e KSU -e KSU_SUSFS -e KSU_SUSFS_ENABLE_LOG \
             -d LOCALVERSION_AUTO -d TRIM_UNUSED_KSYMS
 
+          # Host tools only: tools/lib/bpf hardcodes -Werror (override
+          # CFLAGS) and 6.6.77's libbpf.c trips a const-qualifier warning on
+          # clang 18. Relax host tools; the kernel keeps its own flags.
+          sed -i 's/^override CFLAGS += -Werror -Wall$/override CFLAGS += -Wall/' tools/lib/bpf/Makefile
+          grep -n 'override CFLAGS' tools/lib/bpf/Makefile | head -2
+
           # MODULE_SIG_PROTECT stays ON (stock bixi value). KSU/SUSFS are
           # built-in and do not need module signing relaxed.
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out olddefconfig
