@@ -124,16 +124,32 @@ jobs:
             -o /tmp/kernelsu-setup.sh
           bash /tmp/kernelsu-setup.sh
 
-          if [[ "$(git -C common/KernelSU rev-parse --is-shallow-repository)" == "true" ]]; then
-            git -C common/KernelSU fetch --unshallow --tags origin
+          # Upstream setup.sh layout changed across versions: old clones to
+          # common/KernelSU, new clones to <root>/KernelSU and symlinks
+          # common/drivers/kernelsu. Locate the real repo either way.
+          KSU_DIR=""
+          if [ -d "$SRC/common/KernelSU/.git" ]; then
+            KSU_DIR="$SRC/common/KernelSU"
+          elif [ -e "$SRC/common/drivers/kernelsu" ]; then
+            KSU_DIR=$(dirname "$(readlink -f "$SRC/common/drivers/kernelsu")")
+          elif [ -d "$SRC/KernelSU/.git" ]; then
+            KSU_DIR="$SRC/KernelSU"
+          fi
+          [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR/.git" ] || {
+            echo "::error::cannot locate KernelSU repo"; exit 1; }
+          echo "KSU repo at: $KSU_DIR"
+
+          if [[ "$(git -C "$KSU_DIR" rev-parse --is-shallow-repository)" == "true" ]]; then
+            git -C "$KSU_DIR" fetch --unshallow --tags origin
           else
-            git -C common/KernelSU fetch --tags origin
+            git -C "$KSU_DIR" fetch --tags origin
           fi
 
-          git -C common/KernelSU checkout --detach "${{ inputs.kernelsu_ref }}"
-          git -C common/KernelSU log -1 --format='%H%n%ci%n%s'
+          git -C "$KSU_DIR" checkout --detach "${{ inputs.kernelsu_ref }}"
+          git -C "$KSU_DIR" log -1 --format='%H%n%ci%n%s'
           echo "--- KSU hook into drivers ---"
-          grep -n 'kernelsu' common/drivers/Makefile common/drivers/Kconfig
+          grep -n 'kernelsu' "$SRC/common/drivers/Makefile" "$SRC/common/drivers/Kconfig"
+          echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
 
       - name: Download and pin susfs4ksu
         run: |
@@ -156,7 +172,7 @@ jobs:
              susfs4ksu/kernel_patches/include/linux/susfs_def.h \
              common/include/linux/
 
-          git -C common/KernelSU apply \
+          git -C "$KSU_DIR" apply \
             "$SRC/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
 
           # The 50_ patch was written against a newer 6.6 GKI tree; at the
@@ -176,7 +192,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          KSU_FILE="$SRC/common/KernelSU/kernel/feature/selinux_hide.c"
+          KSU_FILE="$KSU_DIR/kernel/feature/selinux_hide.c"
 
           sed -i \
             -e '/^[[:space:]]*if (security_dump_masked_av_fn)[[:space:]]*$/d' \
