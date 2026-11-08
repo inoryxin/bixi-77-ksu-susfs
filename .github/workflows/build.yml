@@ -1,4 +1,4 @@
-name: build-bixi-kernel-ksu-susfs
+name: build-bixi-kernel-sukisu-susfs
 
 on:
   workflow_dispatch:
@@ -19,14 +19,14 @@ on:
         description: "BUILD_NUMBER (stock bixi 6.6.77 = 13636293)"
         required: true
         default: "13636293"
-      kernelsu_ref:
-        description: "KernelSU commit to pin"
+      sukisu_ref:
+        description: "SukiSU-Ultra branch/commit (builtin branch = manual hooks + native SUSFS)"
         required: true
-        default: "932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e"
+        default: "builtin"
       susfs_ref:
         description: "susfs4ksu commit to pin (branch gki-android15-6.6)"
         required: true
-        default: "eba2a88a5ba303e3d79d08e0717b956e9cf784a1"
+        default: "6f21c8c9a9ea02a9281a2a019dc4802cde5698bc"
 
 permissions:
   contents: read
@@ -110,95 +110,81 @@ jobs:
           "$CLANG_DIR/bin/clang" --version | grep -q 'r510928' \
             || { echo "clang is not r510928; CFI may fail"; exit 1; }
 
-      - name: Install and pin KernelSU
+      - name: Integrate SukiSU-Ultra (builtin branch)
         run: |
           set -euo pipefail
           cd "$SRC"
 
-          curl --fail --location --silent --show-error \
-            https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh \
-            -o /tmp/kernelsu-setup.sh
-          bash /tmp/kernelsu-setup.sh
+          git clone --depth 1 --branch "${{ inputs.sukisu_ref }}" \
+            https://github.com/SukiSU-Ultra/SukiSU-Ultra.git SukiSU-Ultra
+          KSU_DIR="$SRC/SukiSU-Ultra"
+          echo "SukiSU commit: $(git -C SukiSU-Ultra rev-parse HEAD)"
 
-          # Upstream setup.sh layout changed across versions: old clones to
-          # common/KernelSU, new clones to <root>/KernelSU and symlinks
-          # common/drivers/kernelsu. Locate the real repo either way.
-          KSU_DIR=""
-          if [ -d "$SRC/common/KernelSU/.git" ]; then
-            KSU_DIR="$SRC/common/KernelSU"
-          elif [ -e "$SRC/common/drivers/kernelsu" ]; then
-            KSU_DIR=$(dirname "$(readlink -f "$SRC/common/drivers/kernelsu")")
-          elif [ -d "$SRC/KernelSU/.git" ]; then
-            KSU_DIR="$SRC/KernelSU"
-          fi
-          [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR/.git" ] || {
-            echo "::error::cannot locate KernelSU repo"; exit 1; }
-          echo "KSU repo at: $KSU_DIR"
-
-          if [[ "$(git -C "$KSU_DIR" rev-parse --is-shallow-repository)" == "true" ]]; then
-            git -C "$KSU_DIR" fetch --unshallow --tags origin
-          else
-            git -C "$KSU_DIR" fetch --tags origin
-          fi
-
-          git -C "$KSU_DIR" checkout --detach "${{ inputs.kernelsu_ref }}"
-          git -C "$KSU_DIR" log -1 --format='%H%n%ci%n%s'
+          # Wire into drivers/ (same actions as the upstream setup.sh)
+          rm -rf common/drivers/kernelsu
+          ln -s "$KSU_DIR/kernel" common/drivers/kernelsu
+          grep -q '^obj-$(CONFIG_KSU) += kernelsu/' common/drivers/Makefile || \
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> common/drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' common/drivers/Kconfig || \
+            echo 'source "drivers/kernelsu/Kconfig"' >> common/drivers/Kconfig
           echo "--- KSU hook into drivers ---"
-          grep -n 'kernelsu' "$SRC/common/drivers/Makefile" "$SRC/common/drivers/Kconfig"
+          grep -n 'kernelsu' common/drivers/Makefile common/drivers/Kconfig
           echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
-
-      - name: Download and pin susfs4ksu
-        run: |
-          set -euo pipefail
-          cd "$SRC"
-
-          git clone --branch gki-android15-6.6 --single-branch \
-            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
-
-          git -C susfs4ksu checkout --detach "${{ inputs.susfs_ref }}"
-          git -C susfs4ksu log -1 --format='%H%n%ci%n%s'
 
       - name: Apply SUSFS patches
         run: |
           set -euo pipefail
           cd "$SRC"
 
+          git clone --branch gki-android15-6.6 --single-branch --depth 30 \
+            https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          git -C susfs4ksu checkout --detach "${{ inputs.susfs_ref }}"
+          git -C susfs4ksu log -1 --format='SUSFS: %H %s'
+
           cp susfs4ksu/kernel_patches/fs/susfs.c common/fs/
           cp susfs4ksu/kernel_patches/include/linux/susfs.h \
              susfs4ksu/kernel_patches/include/linux/susfs_def.h \
              common/include/linux/
 
-          git -C "$KSU_DIR" apply \
-            "$SRC/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-
-          # The 50_ patch was written against a newer 6.6 GKI tree; at the
-          # 6.6.77 tag the context may drift. git apply is atomic; fall back
-          # to patch(1) with fuzz before giving up.
           git -C common apply \
             "$SRC/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
             || patch -d common -p1 --fuzz=8 \
                < "$SRC/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
 
-          echo "--- susfs files in place ---"
-          ls -la common/fs/susfs.c common/include/linux/susfs.h \
-                 common/include/linux/susfs_def.h
-          grep -n 'susfs' common/fs/Makefile | head -5 || true
+          # Some static helpers have no callers in a kernel-side-only setup;
+          # GKI builds with -Werror. Mark them __maybe_unused.
+          sed -i \
+            -e 's/^static struct cred \*susfs_switch_to_ksu_domain/static __maybe_unused struct cred *susfs_switch_to_ksu_domain/' \
+            -e 's/^static void susfs_restore_creds/static __maybe_unused void susfs_restore_creds/' \
+            common/fs/susfs.c
+          grep -c "__maybe_unused" common/fs/susfs.c
+
+          # The SukiSU builtin branch Kconfig predates the susfs
+          # PRIORITY_UID_FILTER symbol that its own manager code calls.
+          grep -q '^config KSU_SUSFS_PRIORITY_UID_FILTER' \
+            common/drivers/kernelsu/Kconfig || cat >> common/drivers/kernelsu/Kconfig <<'EOF'
+
+config KSU_SUSFS_PRIORITY_UID_FILTER
+	bool "Enable priority uid filter (SukiSU builtin branch API)"
+	depends on KSU_SUSFS
+	default y
+EOF
 
       - name: Apply Clang 18 compatibility fix
         run: |
           set -euo pipefail
 
-          KSU_FILE="$KSU_DIR/kernel/feature/selinux_hide.c"
-
-          sed -i \
-            -e '/^[[:space:]]*if (security_dump_masked_av_fn)[[:space:]]*$/d' \
-            -e '/^[[:space:]]*if (context_struct_compute_av_fn) {[[:space:]]*$/,/^[[:space:]]*}[[:space:]]*$/c\
+          KSU_FILE="$SRC/SukiSU-Ultra/kernel/feature/selinux_hide.c"
+          if [ -f "$KSU_FILE" ] && grep -q 'security_dump_masked_av_fn' "$KSU_FILE"; then
+            sed -i \
+              -e '/^[[:space:]]*if (security_dump_masked_av_fn)[[:space:]]*$/d' \
+              -e '/^[[:space:]]*if (context_struct_compute_av_fn) {[[:space:]]*$/,/^[[:space:]]*}[[:space:]]*$/c\
               context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);' \
-            "$KSU_FILE"
-
-          grep -n -B3 -A5 \
-            -E 'security_dump_masked_av_fn|context_struct_compute_av_fn' \
-            "$KSU_FILE"
+              "$KSU_FILE"
+            echo "clang18 fix applied"
+          else
+            echo "(no vulnerable selinux_hide pattern; skip clang18 fix)"
+          fi
 
       - name: Configure kernel
         run: |
@@ -207,12 +193,10 @@ jobs:
           mkdir -p out
           cp "$GITHUB_WORKSPACE/configs/bixi-stock.config" out/.config
 
-          # Force the stock-style release string with our suffix. MODVERSIONS
-          # ignores the release token when matching vendor module vermagic;
-          # symbol CRCs are gated separately below.
-          # Version string MUST be byte-identical to stock: some vendor
-          # modules and KSU's LKM verify vermagic exactly. Identify the
-          # custom kernel via /proc/version build host/time instead.
+          # Version string MUST be byte-identical to stock: the system_dlkm
+          # module directory is named after uname -r and some LKMs verify
+          # vermagic exactly. Identify the custom kernel via
+          # /proc/version build host/time instead.
           GHASH=$(git rev-parse --short=12 HEAD)
           scripts/config --file out/.config --set-str LOCALVERSION \
             "-${{ inputs.kmi_tag }}-g${GHASH}-ab${{ inputs.build_number }}-4k"
@@ -222,21 +206,13 @@ jobs:
             -d LOCALVERSION_AUTO -d TRIM_UNUSED_KSYMS \
             -d MODULE_SIG_PROTECT
 
-          # Host tools only: tools/lib/bpf hardcodes -Werror (override
-          # CFLAGS) and 6.6.77's libbpf.c trips a const-qualifier warning on
-          # clang 18. Relax host tools; the kernel keeps its own flags.
-          sed -i 's/^override CFLAGS += -Werror -Wall$/override CFLAGS += -Wall/' tools/lib/bpf/Makefile
-          grep -n 'override CFLAGS' tools/lib/bpf/Makefile | head -2
-
-          # MODULE_SIG_PROTECT stays ON (stock bixi value). KSU/SUSFS are
-          # built-in and do not need module signing relaxed.
           make ARCH=arm64 LLVM=1 LLVM_IAS=1 O=out olddefconfig
 
           for k in KSU; do
             grep -q "^CONFIG_$k=y" out/.config || { echo "missing CONFIG_$k"; exit 1; }
           done
           for k in MODVERSIONS LTO_NONE CFI_CLANG SHADOW_CALL_STACK \
-                   DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES KPROBES; do
+                   DEBUG_INFO_BTF DEBUG_INFO_BTF_MODULES KPROBES EXT4_FS; do
             grep -q "^CONFIG_$k=y" out/.config || { echo "ABI-critical CONFIG_$k lost"; exit 1; }
           done
           grep -q "^CONFIG_LOCALVERSION=\"-${{ inputs.kmi_tag }}-g" out/.config
@@ -249,6 +225,12 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/common"
+          # Build identity: byte-identical uname to the stock kernel
+          # (Eros "Tampered kernel" compares build user/host/serial/time).
+          export KBUILD_BUILD_USER=kleaf
+          export KBUILD_BUILD_HOST=build-host
+          export KBUILD_BUILD_VERSION=1
+          export KBUILD_BUILD_TIMESTAMP="Thu Jun 12 08:20:39 UTC 2025"
           sed -i 's/echo "+"//' scripts/setlocalversion 2>/dev/null || true
           make -j"$(nproc)" ARCH=arm64 LLVM=1 LLVM_IAS=1 \
             CROSS_COMPILE=aarch64-linux-gnu- O=out Image modules
@@ -307,10 +289,10 @@ jobs:
             --kernel "$SRC/common/out/arch/arm64/boot/Image" \
             --ramdisk /dev/null \
             --cmdline '' \
-            --output "$DIST/boot-bixi-6.6.77-ksu-susfs.img"
+            --output "$DIST/boot-bixi-6.6.77-sukisu-susfs.img"
 
           "$AVBTOOL" add_hash_footer \
-            --image "$DIST/boot-bixi-6.6.77-ksu-susfs.img" \
+            --image "$DIST/boot-bixi-6.6.77-sukisu-susfs.img" \
             --partition_name boot \
             --partition_size "$PARTITION_SIZE" \
             --algorithm NONE --hash_algorithm sha256 \
@@ -319,12 +301,12 @@ jobs:
             --prop "com.android.build.boot.fingerprint:$FINGERPRINT" \
             --prop "com.android.build.boot.security_patch:$SECURITY_PATCH"
 
-          stat -c 'boot image size: %s' "$DIST/boot-bixi-6.6.77-ksu-susfs.img"
-          test "$(stat -c '%s' "$DIST/boot-bixi-6.6.77-ksu-susfs.img")" -eq "$PARTITION_SIZE"
-          "$AVBTOOL" info_image --image "$DIST/boot-bixi-6.6.77-ksu-susfs.img" \
+          stat -c 'boot image size: %s' "$DIST/boot-bixi-6.6.77-sukisu-susfs.img"
+          test "$(stat -c '%s' "$DIST/boot-bixi-6.6.77-sukisu-susfs.img")" -eq "$PARTITION_SIZE"
+          "$AVBTOOL" info_image --image "$DIST/boot-bixi-6.6.77-sukisu-susfs.img" \
             | tee "$DIST/GENERATED-BOOT-AVB-INFO.txt"
 
-          python3 "$UNPACK" --boot_img "$DIST/boot-bixi-6.6.77-ksu-susfs.img" --out "$DIST/verify"
+          python3 "$UNPACK" --boot_img "$DIST/boot-bixi-6.6.77-sukisu-susfs.img" --out "$DIST/verify"
           cmp "$SRC/common/out/arch/arm64/boot/Image" "$DIST/verify/kernel"
 
       - name: Collect kernel artifacts
@@ -341,15 +323,15 @@ jobs:
             echo "manifest branch: ${{ inputs.manifest_branch }}"
             echo "kernel commit: $(git -C "$SRC/common" rev-parse HEAD)"
             echo "build number: ${{ inputs.build_number }}"
-            echo "KernelSU commit: $(git -C "$SRC/common/KernelSU" rev-parse HEAD)"
+            echo "SukiSU commit: $(git -C "$SRC/SukiSU-Ultra" rev-parse HEAD)"
             echo "SUSFS commit: $(git -C "$SRC/susfs4ksu" rev-parse HEAD)"
             echo "clang: $(clang --version | head -1)"
             echo "kernel banner: $(grep -m1 '^Linux version ' "$SRC/common/out/Image.strings")"
             echo "module_layout: $(grep -w module_layout "$DIST/Module.symvers")"
-            echo "boot image sha256: $(sha256sum "$DIST/boot-bixi-6.6.77-ksu-susfs.img" | cut -d' ' -f1)"
+            echo "boot image sha256: $(sha256sum "$DIST/boot-bixi-6.6.77-sukisu-susfs.img" | cut -d' ' -f1)"
           } > "$DIST/BUILD-INFO.txt"
 
-          ( cd "$DIST" && sha256sum boot-bixi-6.6.77-ksu-susfs.img Image > SHA256SUMS.txt )
+          ( cd "$DIST" && sha256sum boot-bixi-6.6.77-sukisu-susfs.img Image > SHA256SUMS.txt )
 
           cat "$DIST/BUILD-INFO.txt"
           cat "$DIST/SHA256SUMS.txt"
@@ -358,9 +340,9 @@ jobs:
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bixi-kernel-ksu-susfs-${{ inputs.kernel_tag }}
+          name: bixi-kernel-sukisu-susfs-${{ inputs.kernel_tag }}
           path: |
-            dist/boot-bixi-6.6.77-ksu-susfs.img
+            dist/boot-bixi-6.6.77-sukisu-susfs.img
             dist/Image
             dist/Module.symvers
             dist/config.diff
