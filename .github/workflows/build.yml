@@ -19,10 +19,6 @@ on:
         description: "BUILD_NUMBER (stock bixi 6.6.77 = 13636293)"
         required: true
         default: "13636293"
-      version_suffix:
-        description: "Version string suffix, inserted before ab<build>"
-        required: true
-        default: "KSU-SUSFS"
       kernelsu_ref:
         description: "KernelSU commit to pin"
         required: true
@@ -214,13 +210,17 @@ jobs:
           # Force the stock-style release string with our suffix. MODVERSIONS
           # ignores the release token when matching vendor module vermagic;
           # symbol CRCs are gated separately below.
+          # Version string MUST be byte-identical to stock: some vendor
+          # modules and KSU's LKM verify vermagic exactly. Identify the
+          # custom kernel via /proc/version build host/time instead.
           GHASH=$(git rev-parse --short=12 HEAD)
           scripts/config --file out/.config --set-str LOCALVERSION \
-            "-${{ inputs.kmi_tag }}-g${GHASH}-${{ inputs.version_suffix }}-ab${{ inputs.build_number }}-4k"
+            "-${{ inputs.kmi_tag }}-g${GHASH}-ab${{ inputs.build_number }}-4k"
 
           scripts/config --file out/.config \
             -e KSU -e KSU_SUSFS -e KSU_SUSFS_ENABLE_LOG \
-            -d LOCALVERSION_AUTO -d TRIM_UNUSED_KSYMS
+            -d LOCALVERSION_AUTO -d TRIM_UNUSED_KSYMS \
+            -d MODULE_SIG_PROTECT
 
           # Host tools only: tools/lib/bpf hardcodes -Werror (override
           # CFLAGS) and 6.6.77's libbpf.c trips a const-qualifier warning on
@@ -341,7 +341,6 @@ jobs:
             echo "manifest branch: ${{ inputs.manifest_branch }}"
             echo "kernel commit: $(git -C "$SRC/common" rev-parse HEAD)"
             echo "build number: ${{ inputs.build_number }}"
-            echo "version suffix: ${{ inputs.version_suffix }}"
             echo "KernelSU commit: $(git -C "$SRC/common/KernelSU" rev-parse HEAD)"
             echo "SUSFS commit: $(git -C "$SRC/susfs4ksu" rev-parse HEAD)"
             echo "clang: $(clang --version | head -1)"
